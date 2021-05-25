@@ -22,6 +22,8 @@ from .. import db
 DOZER_LOGGER = logging.getLogger(__name__)
 
 ADD_LIMIT = 2147483647
+# ENTROPY_DELAY = 86400  # 1 Day in seconds
+ENTROPY_DELAY = 10
 LEVEL_SET_LIMIT = 100000
 LEVEL_CALC_LIMIT = 1000000
 
@@ -267,9 +269,20 @@ class Levels(Cog):
         old_xp = cached_member.total_xp
 
         timestamp = message.created_at.replace(tzinfo=timezone.utc)
+
+        if cached_member.last_given_at is not None or timestamp - cached_member.last_given_at > timedelta(seconds=ENTROPY_DELAY):
+            if guild_settings.entropy_value != 0:
+                calcs = (timestamp - cached_member.last_given_at).total_seconds() / ENTROPY_DELAY
+                print(calcs)
+                for day in range(1, int(calcs)):
+                    lost_xp = int(cached_member.total_xp * (guild_settings.entropy_value * 0.001))
+                    # print(lost_xp)
+                    # cached_member.total_xp -= lost_xp
+
         if cached_member.last_given_at is None or timestamp - cached_member.last_given_at > timedelta(seconds=guild_settings.xp_cooldown):
             cached_member.total_xp += random.randint(guild_settings.xp_min, guild_settings.xp_max)
             cached_member.last_given_at = timestamp
+
         cached_member.total_messages += 1
         cached_member.dirty = True
 
@@ -586,7 +599,7 @@ class Levels(Cog):
                     xp_min=5,
                     xp_max=15,
                     xp_cooldown=15,
-                    entropy_value=0,  # Is in table but is not used yet
+                    entropy_value=0.0001,  # Is in table but is not used yet
                     lvl_up_msgs=GuildXPSettings.nullify,
                     keep_old_roles=True,
                     enabled=False
@@ -597,7 +610,7 @@ class Levels(Cog):
                 xp_min=int(xp_min) if xp_min is not None else old_ent.xp_min,
                 xp_max=int(xp_max) if xp_max is not None else old_ent.xp_max,
                 xp_cooldown=int(xp_cooldown) if xp_cooldown is not None else old_ent.xp_cooldown,
-                entropy_value=0,  # Is in table but is not used yet
+                entropy_value=0.0001,  # Is in table but is not used yet
                 lvl_up_msgs=int(lvl_up_msgs_id) if lvl_up_msgs_id else old_ent.lvl_up_msgs if not no_lvl_up else GuildXPSettings.nullify,
                 keep_old_roles=not old_ent.keep_old_roles if keep_old_roles_toggle else old_ent.keep_old_roles,
                 enabled=not old_ent.enabled if toggle_enabled else old_ent.enabled
@@ -612,6 +625,7 @@ class Levels(Cog):
             embed.add_field(name=f"Levels are {enabled} for {ctx.guild}", value=f"XP min: {ent.xp_min}\n"
                                                                                 f"XP max: {ent.xp_max}\n"
                                                                                 f"Cooldown: {ent.xp_cooldown} Seconds\n"
+                                                                                f"XP decay: {ent.entropy_value}% per day\n"
                                                                                 f"Keep old roles: {ent.keep_old_roles}\n"
                                                                                 f"Notification channel: {lvl_up_msgs}")
             await ctx.send(embed=embed)
