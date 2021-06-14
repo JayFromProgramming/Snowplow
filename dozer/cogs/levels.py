@@ -150,6 +150,17 @@ class Levels(Cog):
                 if channel:
                     await channel.send(f"{member.mention}, you have reached level {new_level}!")
 
+    async def check_xp_decay(self, guild_settings, cached_member, time: datetime):
+        if cached_member.last_given_at is not None or time - cached_member.last_given_at > timedelta(seconds=ENTROPY_DELAY):
+            if guild_settings.entropy_value != 0:
+                calcs = (time - cached_member.last_given_at).total_seconds() / ENTROPY_DELAY
+                print(calcs)
+                for day in range(1, int(calcs)):
+                    lost_xp = int(cached_member.total_xp * (guild_settings.entropy_value * 0.001))
+                    print(lost_xp)
+                    # cached_member.total_xp -= lost_xp
+                    cached_member.dirty = True
+
     async def load_member(self, guild_id, member_id):
         """Check to see if a member is in the level cache and if not load from the database"""
         cached_member = self._xp_cache.get((guild_id, member_id))
@@ -203,7 +214,7 @@ class Levels(Cog):
                 await conn.executemany(f"INSERT INTO {MemberXP.__tablename__} (guild_id, user_id, total_xp, total_messages, last_given_at)"
                                        f" VALUES ($1, $2, $3, $4, $5) ON CONFLICT ({MemberXP.__uniques__}) DO UPDATE"
                                        f" SET total_xp = EXCLUDED.total_xp, total_messages = EXCLUDED.total_messages, last_given_at = "
-                                       f"EXCLUDED.last_given_at",
+                                       f"EXCLUDED.last_given_at, last_updated_at = current_timestamp",
                                        to_write)
             DOZER_LOGGER.debug(f"Inserted/updated {len(to_write)} record(s); Evicted {evicted} records(s)")
         except Exception as e:
@@ -270,14 +281,7 @@ class Levels(Cog):
 
         timestamp = message.created_at.replace(tzinfo=timezone.utc)
 
-        if cached_member.last_given_at is not None or timestamp - cached_member.last_given_at > timedelta(seconds=ENTROPY_DELAY):
-            if guild_settings.entropy_value != 0:
-                calcs = (timestamp - cached_member.last_given_at).total_seconds() / ENTROPY_DELAY
-                print(calcs)
-                for day in range(1, int(calcs)):
-                    lost_xp = int(cached_member.total_xp * (guild_settings.entropy_value * 0.001))
-                    # print(lost_xp)
-                    # cached_member.total_xp -= lost_xp
+        await self.check_xp_decay(guild_settings, cached_member, timestamp)
 
         if cached_member.last_given_at is None or timestamp - cached_member.last_given_at > timedelta(seconds=guild_settings.xp_cooldown):
             cached_member.total_xp += random.randint(guild_settings.xp_min, guild_settings.xp_max)
@@ -788,13 +792,14 @@ class MemberXP(db.DatabaseTable):
             PRIMARY KEY (guild_id, user_id)
             )""")
 
-    def __init__(self, guild_id, user_id, total_xp, total_messages, last_given_at):
+    def __init__(self, guild_id, user_id, total_xp, total_messages, last_given_at, last_updated_at):
         super().__init__()
         self.guild_id = guild_id
         self.user_id = user_id
         self.total_xp = total_xp
         self.total_messages = total_messages
         self.last_given_at = last_given_at
+        self.last_updated_at = last_updated_at
 
     @classmethod
     async def get_by(cls, **kwargs):
@@ -803,9 +808,18 @@ class MemberXP(db.DatabaseTable):
         for result in results:
             obj = MemberXP(guild_id=result.get("guild_id"), user_id=result.get("user_id"),
                            total_xp=result.get("total_xp"), total_messages=result.get("total_messages"),
-                           last_given_at=result.get("last_given_at"))
+                           last_given_at=result.get("last_given_at"), last_updated_at=result.get("last_updated_at"))
             result_list.append(obj)
         return result_list
+
+    async def version_1(self):
+        """DB migration v1"""
+        async with db.Pool.acquire() as conn:
+            await conn.execute(f"""
+            ALTER TABLE {self.__tablename__} ADD COLUMN IF NOT EXISTS last_updated_at timestamptz NOT NULL default CURRENT_TIMESTAMP; 
+            """)
+
+    __versions__ = [version_1]
 
 
 class MemberXPCache:
@@ -814,20 +828,21 @@ class MemberXPCache:
         whether the record has been changed since it was loaded from the database or created.
     """
 
-    def __init__(self, total_xp: int, last_given_at: datetime, total_messages: int, dirty: bool):
+    def __init__(self, total_xp: int, last_given_at: datetime, last_updated_at: datetime, total_messages: int, dirty: bool):
         self.total_xp = total_xp
         self.total_messages = total_messages
         self.last_given_at = last_given_at
+        self.last_updated_at = last_updated_at
         self.dirty = dirty
 
     def __repr__(self):
-        return f"<MemberXPCache total_xp={self.total_xp!r} last_given_at={self.last_given_at!r} total_messages={self.last_given_at!r}" \
-               f" dirty={self.dirty!r}>"
+        return f"<MemberXPCache total_xp={self.total_xp!r} last_given_at={self.last_given_at!r} last_updated_at={self.last_updated_at!r} " \
+               f"total_messages={self.last_given_at!r} dirty={self.dirty!r}>"
 
     @classmethod
     def from_record(cls, record):
         """Create a cache entry from a database record. This copies all shared fields and sets `dirty` to False."""
-        return cls(record.total_xp, record.last_given_at, record.total_messages, False)
+        return cls(record.total_xp, record.last_given_at, record.last_updated_at, record.total_messages, False)
 
 
 class GuildXPSettings(db.DatabaseTable):
@@ -881,6 +896,49 @@ class GuildXPSettings(db.DatabaseTable):
             """)
 
     __versions__ = [version_1]
+
+
+class MemberActivityTracker(db.DatabaseTable):
+    """Database table containing per-guild settings related to XP gain."""
+    __tablename__ = "member_activity_tracking"
+    __uniques__ = "guild_id, user_id"
+
+    @classmethod
+    async def initial_create(cls):
+        """Create the table in the database"""
+        async with db.Pool.acquire() as conn:
+            await conn.execute(f"""
+            CREATE TABLE {cls.__tablename__} (
+                guild_id bigint NOT NULL,
+                user_id bigint NOT NULL,
+                save_period_start_date date NOT NULL default current_date,
+                save_period_end_date date default NULL, 
+                interval_total_messages int NOT NULL default 0,
+                interval_time_active int NOT NULL default 0,
+                PRIMARY KEY (guild_id, user_id, save_period_start_date)
+            )""")
+
+    def __init__(self, guild_id, user_id, save_period_start_date, interval_total_messages, interval_time_active, save_period_end_date=None):
+        super().__init__()
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.save_period_start_date = save_period_start_date
+        self.save_period_end_date = save_period_end_date
+        self.interval_total_messages = interval_total_messages
+        self.interval_time_active = interval_time_active
+
+    @classmethod
+    async def get_by(cls, **kwargs):
+        results = await super().get_by(**kwargs)
+        result_list = []
+        for result in results:
+            obj = MemberActivityTracker(guild_id=result.get("guild_id"), user_id=result.get("user_id"),
+                                        save_period_start_date=result.get("save_period_start_date"),
+                                        save_period_end_date=result.get("save_period_end_date"),
+                                        interval_total_messages=result.get("interval_total_messages"),
+                                        interval_time_active=result.get("interval_time_active"))
+            result_list.append(obj)
+        return result_list
 
 
 def setup(bot):
