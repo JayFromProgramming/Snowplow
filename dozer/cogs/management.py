@@ -8,6 +8,7 @@ from datetime import timezone, datetime
 
 import discord
 from dateutil import parser
+from discord.app_commands import Command
 from discord.ext.commands import has_permissions, BadArgument
 from discord.utils import escape_markdown
 from loguru import logger
@@ -185,6 +186,195 @@ class Management(Cog):
     list.example_usage = """
     `{prefix}schedulesend list`: Lists all scheduled messages for the current guild
     """
+
+    @command(aliases=["lockchannelorder", "locksidebar"])
+    @has_permissions(manage_channels=True)
+    @bot_has_permissions(manage_channels=True)
+    async def lockorder(self, ctx: DozerContext, lock_type: str):
+        """
+        For initial debugging just print all in order of position in the guild
+        """
+        guild = ctx.guild
+        channels = guild.channels
+        categories = guild.categories
+        embed = discord.Embed(color=blurple, title="Position orders locked", description="The following channels and categories have had"
+                                                                                         " their positions locked")
+        if lock_type == "all":
+            await GuildOrderLocks(guild.id, True, True).update_or_add()
+            # Create a list of channels and categories and add it to the database
+            for channel in filter(lambda c: isinstance(c, discord.TextChannel), channels):
+                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position).update_or_add()
+            embed.add_field(name="Locked text channels", value=len([c for c in channels if isinstance(c, discord.TextChannel)]), inline=False)
+            for channel in filter(lambda c: isinstance(c, discord.VoiceChannel), channels):
+                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+            embed.add_field(name="Locked voice channels", value=len([c for c in channels if isinstance(c, discord.VoiceChannel)]), inline=False)
+            for category in categories:
+                await GuildChannelOrders(guild.id, category.id, "category", category.position).update_or_add()
+            embed.add_field(name="Locked categories", value=len(categories), inline=False)
+        elif lock_type == "categories":
+            await GuildOrderLocks(guild.id, True, False).update_or_add()
+            for category in categories:
+                await GuildChannelOrders(guild.id, category.id, "category", category.position).update_or_add()
+            embed.add_field(name="Locked categories", value=len(categories))
+        elif lock_type == "channels":
+            await GuildOrderLocks(guild.id, False, True).update_or_add()
+            for channel in filter(lambda c: isinstance(c, discord.TextChannel), channels):
+                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position).update_or_add()
+            embed.add_field(name="Locked text channels", value=len([c for c in channels if isinstance(c, discord.TextChannel)]), inline=False)
+            for channel in filter(lambda c: isinstance(c, discord.VoiceChannel), channels):
+                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+            embed.add_field(name="Locked voice channels", value=len([c for c in channels if isinstance(c, discord.VoiceChannel)]), inline=False)
+
+        embed.set_footer(text='Triggered by ' + escape_markdown(ctx.author.display_name))
+        await ctx.send(embed=embed)
+
+    lockorder.example_usage = """
+    `{prefix}lockorder all`: Locks all channels and categories in the current guild
+    `{prefix}lockorder categories`: Locks all categories in the current guild
+    `{prefix}lockorder channels`: Locks all channels in the current guild
+    """
+
+    @command(aliases=["unlockchannelorder", "unlocksidebar"])
+    @has_permissions(manage_channels=True)
+    async def unlockorder(self, ctx: DozerContext, lock_type: str):
+        guild = ctx.guild
+        if lock_type == "all":
+            await GuildOrderLocks.delete(guild_id=guild.id)
+            # Remove all positions from the database for this guild
+            await GuildChannelOrders.delete(guild_id=guild.id)
+        elif lock_type == "categories":
+            await GuildOrderLocks(guild.id, False, True).update_or_add()
+        elif lock_type == "channels":
+            await GuildOrderLocks(guild.id, True, False).update_or_add()
+
+        embed = discord.Embed(color=blurple)
+        embed.set_author(name='Unlock Order', icon_url=ctx.author.avatar_url)
+        embed.add_field(name='Success', value=f"Unlocked {lock_type} order for {guild.name}")
+        embed.set_footer(text='Triggered by ' + escape_markdown(ctx.author.display_name))
+        await ctx.send(embed=embed)
+
+    unlockorder.example_usage = """
+    `{prefix}unlockorder all`: Unlocks all channels and categories in the current guild
+    `{prefix}unlockorder categories`: Unlocks all categories in the current guild
+    `{prefix}unlockorder channels`: Unlocks all channels in the current guild
+    """
+
+    @Cog.listener("on_guild_channel_create")
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        """If the channel is a category and the category order is locked, then add it to the database"""
+        # Check if the guild has order locks
+
+        entry = await GuildOrderLocks.get_by(guild_id=channel.guild.id)
+        if entry:
+            if entry[0].channels_locked:
+                # Update the positions of all channels in the database for this guild to account for the new channel
+                for channel in channel.guild.channels:
+                    if isinstance(channel, discord.abc.TextChannel):
+                        await GuildChannelOrders(channel.guild.id, channel.id, "text_channel", channel.position).update_or_add()
+                    elif isinstance(channel, discord.abc.VoiceChannel):
+                        await GuildChannelOrders(channel.guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+
+    @Cog.listener("on_guild_channel_delete")
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        """If the channel is a category and the category order is locked, then remove it from the database"""
+        # Check if the guild has order locks
+        entry = await GuildOrderLocks.get_by(guild_id=channel.guild.id)
+        if entry:
+            if entry[0].channels_locked:
+                # Remove the channel from the database
+                await GuildChannelOrders.delete(guild_id=channel.guild.id, channel_id=channel.id)
+            # Update the positions of all channels in the database for this guild to account for the deleted channel
+            for channel in channel.guild.channels:
+                if isinstance(channel, discord.abc.TextChannel):
+                    await GuildChannelOrders(channel.guild.id, channel.id, "text_channel", channel.position).update_or_add()
+                elif isinstance(channel, discord.abc.VoiceChannel):
+                    await GuildChannelOrders(channel.guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+
+    @Cog.listener("on_guild_channel_update")
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        """If the channel is a category and the category order is locked, then update it in the database"""
+        # Check if the guild has order locks
+        entry = await GuildOrderLocks.get_by(guild_id=after.guild.id)
+        if entry:
+            if entry[0].channels_locked:
+                # Check if the channel is in the right spot
+                if isinstance(after, discord.abc.TextChannel):
+                    position = await GuildChannelOrders.get_by(guild_id=after.guild.id, item_id=after.id)
+                    if position:
+                        if position[0].position != after.position:
+                            logger.info(f"Updating text channel {after.name} to position {position[0].position}")
+                            await after.edit(position=position[0].position)
+                elif isinstance(after, discord.abc.VoiceChannel):
+                    position = await GuildChannelOrders.get_by(guild_id=after.guild.id, item_id=after.id)
+                    if position:
+                        if position[0].position != after.position:
+                            logger.info(f"Updating voice channel {after.name} to position {position[0].position}")
+                            await after.edit(position=position[0].position)
+
+
+class GuildOrderLocks(db.DatabaseTable):
+    __tablename__ = 'guild_order_locks'
+    __uniques__ = 'guild_id'
+
+    @classmethod
+    async def initial_create(cls):
+        """Create the table in the database"""
+        # If category_locked is true, then the category order is locked and cannot be changed
+        # If channels_locked is true, then the channel order inside of categories is locked and cannot be changed
+        async with db.Pool.acquire() as conn:
+            await conn.execute(f"""
+            CREATE TABLE {cls.__tablename__} (
+            guild_id bigint NOT NULL,
+            category_locked boolean NOT NULL,  
+            channels_locked boolean NOT NULL,
+            PRIMARY KEY (guild_id)
+            )""")
+
+    def __init__(self, guild_id: int, category_locked: bool, channels_locked: bool):
+        self.guild_id = guild_id
+        self.category_locked = category_locked
+        self.channels_locked = channels_locked
+
+    @classmethod
+    async def get_by(cls, guild_id: int):
+        """Get all rows that match the given criteria"""
+        async with db.Pool.acquire() as conn:
+            rows = await conn.fetch(f"SELECT * FROM {cls.__tablename__} WHERE guild_id = $1", guild_id)
+        return [cls(**row) for row in rows]  # Return a list of objects created from the returned rows
+
+
+class GuildChannelOrders(db.DatabaseTable):
+    __tablename__ = 'channel_orders'
+    __uniques__ = 'guild_id, item_id'
+
+    @classmethod
+    async def initial_create(cls):
+        """Create the table in the database"""
+        async with db.Pool.acquire() as conn:
+            await conn.execute(f"""
+            CREATE TABLE {cls.__tablename__} (
+            guild_id bigint NOT NULL,
+            item_id bigint NOT NULL,
+            item_type text NOT NULL,
+            position bigint NOT NULL,
+            PRIMARY KEY (guild_id, item_id)
+            )""")
+
+    def __init__(self, guild_id: int, item_id: int, item_type: str, position: int):
+        self.guild_id = guild_id
+        self.item_id = item_id
+        self.item_type = item_type
+        self.position = position
+
+    @classmethod
+    async def get_by(cls, guild_id: int, item_id: int):
+        """Get all entries that match the given criteria"""
+        async with db.Pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+            SELECT * FROM {cls.__tablename__}
+            WHERE guild_id = $1 AND item_id = $2
+            """, guild_id, item_id)
+            return [cls(**row) for row in rows]
 
 
 class ScheduledMessages(db.DatabaseTable):
