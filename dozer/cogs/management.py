@@ -28,6 +28,8 @@ class Management(Cog):
     def __init__(self, bot: Dozer):
         super().__init__(bot)
         self.started_timers = False
+        self.reposition_lock = asyncio.Lock()
+        self.repositioning_guilds = []
         self.timers = {}
         if os.path.isfile(TIMEZONE_FILE):
             logger.info("Loaded timezone configurations")
@@ -203,10 +205,10 @@ class Management(Cog):
             await GuildOrderLocks(guild.id, True, True).update_or_add()
             # Create a list of channels and categories and add it to the database
             for channel in filter(lambda c: isinstance(c, discord.TextChannel), channels):
-                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position).update_or_add()
+                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position, channel.category_id).update_or_add()
             embed.add_field(name="Locked text channels", value=len([c for c in channels if isinstance(c, discord.TextChannel)]), inline=False)
             for channel in filter(lambda c: isinstance(c, discord.VoiceChannel), channels):
-                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position, channel.category_id).update_or_add()
             embed.add_field(name="Locked voice channels", value=len([c for c in channels if isinstance(c, discord.VoiceChannel)]), inline=False)
             for category in categories:
                 await GuildChannelOrders(guild.id, category.id, "category", category.position).update_or_add()
@@ -219,10 +221,10 @@ class Management(Cog):
         elif lock_type == "channels":
             await GuildOrderLocks(guild.id, False, True).update_or_add()
             for channel in filter(lambda c: isinstance(c, discord.TextChannel), channels):
-                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position).update_or_add()
+                await GuildChannelOrders(guild.id, channel.id, "text_channel", channel.position, channel.category_id).update_or_add()
             embed.add_field(name="Locked text channels", value=len([c for c in channels if isinstance(c, discord.TextChannel)]), inline=False)
             for channel in filter(lambda c: isinstance(c, discord.VoiceChannel), channels):
-                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+                await GuildChannelOrders(guild.id, channel.id, "voice_channel", channel.position, channel.category_id).update_or_add()
             embed.add_field(name="Locked voice channels", value=len([c for c in channels if isinstance(c, discord.VoiceChannel)]), inline=False)
 
         embed.set_footer(text='Triggered by ' + escape_markdown(ctx.author.display_name))
@@ -263,21 +265,23 @@ class Management(Cog):
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
         """If the channel is a category and the category order is locked, then add it to the database"""
         # Check if the guild has order locks
-
+        await self.reposition_lock.acquire()  # Acquire the lock to prevent us from repositioning channels we are currently repositioning
         entry = await GuildOrderLocks.get_by(guild_id=channel.guild.id)
         if entry:
             if entry[0].channels_locked:
                 # Update the positions of all channels in the database for this guild to account for the new channel
                 for channel in channel.guild.channels:
-                    if isinstance(channel, discord.abc.TextChannel):
+                    if isinstance(channel, discord.TextChannel):
                         await GuildChannelOrders(channel.guild.id, channel.id, "text_channel", channel.position).update_or_add()
-                    elif isinstance(channel, discord.abc.VoiceChannel):
+                    elif isinstance(channel, discord.VoiceChannel):
                         await GuildChannelOrders(channel.guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+        self.reposition_lock.release()  # Release the lock
 
     @Cog.listener("on_guild_channel_delete")
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         """If the channel is a category and the category order is locked, then remove it from the database"""
         # Check if the guild has order locks
+        await self.reposition_lock.acquire()  # Acquire the lock to prevent us from repositioning channels we are currently repositioning
         entry = await GuildOrderLocks.get_by(guild_id=channel.guild.id)
         if entry:
             if entry[0].channels_locked:
@@ -285,31 +289,85 @@ class Management(Cog):
                 await GuildChannelOrders.delete(guild_id=channel.guild.id, channel_id=channel.id)
             # Update the positions of all channels in the database for this guild to account for the deleted channel
             for channel in channel.guild.channels:
-                if isinstance(channel, discord.abc.TextChannel):
+                if isinstance(channel, discord.TextChannel):
                     await GuildChannelOrders(channel.guild.id, channel.id, "text_channel", channel.position).update_or_add()
-                elif isinstance(channel, discord.abc.VoiceChannel):
+                elif isinstance(channel, discord.VoiceChannel):
                     await GuildChannelOrders(channel.guild.id, channel.id, "voice_channel", channel.position).update_or_add()
+        self.reposition_lock.release()  # Release the lock
+
+    async def reposition_channels(self, guild: discord.Guild, move_channels=True, move_categories=True):
+        """Repositions all channels in the guild to their original positions"""
+        logger.info(f"Repositioning channels for guild {guild.name}")
+        # Get all the channels in the database for this guild
+        entries = await GuildChannelOrders.get_by(guild_id=guild.id)
+        channels = guild.channels  # Preload the channels to prevent the bot from getting rate limited
+        if entries:
+            # Sort the channels by their position in reverse order so that updating the position doesn't mess up the order we've already set
+            entries.sort(key=lambda e: e.position)
+            # Iterate through the channels and move them to their original positions
+            for entry in entries:
+                channel = [c for c in channels if c.id == entry.item_id][0]  # Get the channel from the list of channels
+                if channel:
+                    if isinstance(channel, discord.TextChannel):
+                        if move_channels and channel.category_id != entry.category_id:
+                            target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
+                            logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
+                            await channel.edit(category=target_category_name)
+                            await asyncio.sleep(0.5)  # Wait for the channel to move before moving it to the correct position
+                        if move_channels and channel.position != entry.position:
+                            logger.debug(f"Moving channel {channel.name} to position {entry.position}")
+                            await channel.edit(position=entry.position)
+                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
+                    elif isinstance(channel, discord.VoiceChannel):
+                        if move_channels and channel.category_id != entry.category_id:
+                            target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
+                            logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
+                            await channel.edit(category=target_category_name)
+                            await asyncio.sleep(0.5)
+                        if move_channels and channel.position != entry.position:
+                            logger.debug(f"Moving channel {channel.name} to position {entry.position}")
+                            await channel.edit(position=entry.position)
+                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
+                    elif isinstance(channel, discord.CategoryChannel):
+                        if move_categories and channel.position != entry.position:
+                            await channel.edit(position=entry.position)
+                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channels
 
     @Cog.listener("on_guild_channel_update")
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
         """If the channel is a category and the category order is locked, then update it in the database"""
+        # Check if this update was caused by us moving a channel back to its original position
+        if before.position == after.position:
+            return
+        if after.guild.id in self.repositioning_guilds:
+            return
+        self.repositioning_guilds.append(after.guild.id)
         # Check if the guild has order locks
+        await self.reposition_lock.acquire()  # Acquire the lock to prevent us from repositioning channels we are currently repositioning
         entry = await GuildOrderLocks.get_by(guild_id=after.guild.id)
         if entry:
-            if entry[0].channels_locked:
-                # Check if the channel is in the right spot
-                if isinstance(after, discord.abc.TextChannel):
-                    position = await GuildChannelOrders.get_by(guild_id=after.guild.id, item_id=after.id)
-                    if position:
-                        if position[0].position != after.position:
-                            logger.info(f"Updating text channel {after.name} to position {position[0].position}")
-                            await after.edit(position=position[0].position)
-                elif isinstance(after, discord.abc.VoiceChannel):
-                    position = await GuildChannelOrders.get_by(guild_id=after.guild.id, item_id=after.id)
-                    if position:
-                        if position[0].position != after.position:
-                            logger.info(f"Updating voice channel {after.name} to position {position[0].position}")
-                            await after.edit(position=position[0].position)
+            embed = discord.Embed(title="Channel Order Locked!",
+                                  description=f"The channel order for `{after.guild.name}` is locked, "
+                                              "if you would like to unlock the channel order, use the `unlock_channel_order` command",
+                                  color=discord.Color.yellow())
+            embed.set_footer(text=f"{self.bot.user.name} is currently moving channels back to their original positions, please wait")
+            local_msg = None
+            sys_msg = None
+            if isinstance(after, discord.TextChannel):
+                local_msg = await after.send(embed=embed)
+            if after.guild.system_channel is not None:
+                embed.add_field(name="Moved Channel", value=after.mention, inline=False)
+                sys_msg = await after.guild.system_channel.send(embed=embed)
+            await self.reposition_channels(after.guild, move_channels=entry[0].channels_locked, move_categories=entry[0].category_locked)
+            embed.colour = discord.Color.green()
+            embed.set_footer(text=f"{self.bot.user.name} has finished moving channels back to their original positions")
+            if local_msg:
+                await local_msg.edit(embed=embed)
+            if sys_msg:
+                await sys_msg.edit(embed=embed)
+        self.repositioning_guilds.remove(after.guild.id)
+        self.reposition_lock.release()  # Release the lock
+        logger.info(f"Finished repositioning channels for guild {after.guild.name}")
 
 
 class GuildOrderLocks(db.DatabaseTable):
@@ -357,18 +415,25 @@ class GuildChannelOrders(db.DatabaseTable):
             item_id bigint NOT NULL,
             item_type text NOT NULL,
             position bigint NOT NULL,
+            category_id bigint NULL DEFAULT NULL,
             PRIMARY KEY (guild_id, item_id)
             )""")
 
-    def __init__(self, guild_id: int, item_id: int, item_type: str, position: int):
+    def __init__(self, guild_id: int, item_id: int, item_type: str, position: int, category_id: int = None):
         self.guild_id = guild_id
         self.item_id = item_id
         self.item_type = item_type
         self.position = position
+        self.category_id = category_id
 
     @classmethod
-    async def get_by(cls, guild_id: int, item_id: int):
+    async def get_by(cls, guild_id: int, item_id: int = None):
         """Get all entries that match the given criteria"""
+        if item_id is None:
+            async with db.Pool.acquire() as conn:
+                rows = await conn.fetch(f"SELECT * FROM {cls.__tablename__} WHERE guild_id = $1", guild_id)
+            return [cls(**row) for row in rows]
+        # Else get the specific entry
         async with db.Pool.acquire() as conn:
             rows = await conn.fetch(f"""
             SELECT * FROM {cls.__tablename__}
