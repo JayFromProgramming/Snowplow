@@ -301,37 +301,40 @@ class Management(Cog):
         # Get all the channels in the database for this guild
         entries = await GuildChannelOrders.get_by(guild_id=guild.id)
         channels = guild.channels  # Preload the channels to prevent the bot from getting rate limited
+        # Add the categories to channels
         if entries:
             # Sort the channels by their position in reverse order so that updating the position doesn't mess up the order we've already set
             entries.sort(key=lambda e: e.position)
-            # Iterate through the channels and move them to their original positions
+            # Then put the categories first so that we can move them to their original positions before moving the channels
+            entries.sort(key=lambda e: e.item_type == "category", reverse=True)
             for entry in entries:
                 channel = [c for c in channels if c.id == entry.item_id][0]  # Get the channel from the list of channels
-                if channel:
-                    if isinstance(channel, discord.TextChannel):
-                        if move_channels and channel.category_id != entry.category_id:
-                            target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
-                            logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
-                            await channel.edit(category=target_category_name)
-                            await asyncio.sleep(0.5)  # Wait for the channel to move before moving it to the correct position
-                        if move_channels and channel.position != entry.position:
-                            logger.debug(f"Moving channel {channel.name} to position {entry.position}")
-                            await channel.edit(position=entry.position)
-                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
-                    elif isinstance(channel, discord.VoiceChannel):
-                        if move_channels and channel.category_id != entry.category_id:
-                            target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
-                            logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
-                            await channel.edit(category=target_category_name)
-                            await asyncio.sleep(0.5)
-                        if move_channels and channel.position != entry.position:
-                            logger.debug(f"Moving channel {channel.name} to position {entry.position}")
-                            await channel.edit(position=entry.position)
-                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
-                    elif isinstance(channel, discord.CategoryChannel):
-                        if move_categories and channel.position != entry.position:
-                            await channel.edit(position=entry.position)
-                            await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channels
+                if isinstance(channel, discord.TextChannel):
+                    if move_channels and channel.category_id != entry.category_id:
+                        target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
+                        logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
+                        await channel.edit(category=target_category_name)
+                        await asyncio.sleep(0.5)  # Wait for the channel to move before moving it to the correct position
+                    if move_channels and channel.position != entry.position and channel.category_id == entry.category_id:
+                        logger.debug(f"Moving channel {channel.name} to position {entry.position}")
+                        await channel.edit(position=entry.position)
+                        await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
+                elif isinstance(channel, discord.VoiceChannel):
+                    if move_channels and channel.category_id != entry.category_id:
+                        target_category_name = guild.get_channel(entry.category_id) if entry.category_id else None
+                        logger.debug(f"Moving channel {channel.name} to category {target_category_name}")
+                        await channel.edit(category=target_category_name)
+                        await asyncio.sleep(0.5)
+                    if move_channels and channel.position != entry.position and channel.category_id == entry.category_id:
+                        logger.debug(f"Moving channel {channel.name} to position {entry.position}")
+                        await channel.edit(position=entry.position)
+                        await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channel
+                elif isinstance(channel, discord.CategoryChannel):
+                    if move_categories and channel.position != entry.position:
+                        logger.debug(f"Moving category {channel.name} to position {entry.position}")
+                        await channel.edit(position=entry.position)
+                        await asyncio.sleep(0.75)  # Wait for the channel to move before moving the next channels
+                        channels = await guild.fetch_channels()  # Update the channels list to account for the new positions
 
     @Cog.listener("on_guild_channel_update")
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
