@@ -139,22 +139,22 @@ class Modmail(Cog):
 
     @command()
     @has_permissions(administrator=True)
-    async def configure_modmail(self, ctx: DozerContext, target_channel):
+    async def configure_modmail(self, ctx: DozerContext, target_channel: discord.TextChannel):
         """Modmail configuration command. target_channel may be in another guild."""
-        config = ModmailConfig(ctx.guild.id, int(target_channel))
+        config = ModmailConfig(ctx.guild.id, target_channel.id)
         await config.update_or_add()
         await ctx.reply("Configuration saved!")
 
     @command()
     @has_permissions(administrator=True)
-    async def create_modmail_button(self, ctx):
+    async def create_modmail_button(self, ctx, *, message: str = "Click here to start a modmail thread!"):
         """Creates modmail button"""
         target_record = await ModmailConfig.get_by(guild_id=ctx.guild.id)
         if len(target_record) == 0:
             await ctx.reply("Modmail is not configured for this server!")
             return
         view = Buttons()
-        await ctx.send("Click the button to start a new modmail thread!", view=view)
+        await ctx.send(message, view=view)
 
     @command()
     async def modmail_close(self, ctx: DozerContext):
